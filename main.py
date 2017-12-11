@@ -11,18 +11,18 @@ folder = "data"
 
 # file must be in .mp4 format!
 # name = "hoonigan_short"
-name = "RallyBudgetRacing3"
+name = "805391579"
 
 ########################################################################################################################
 # output configuration
 
-fps = 60
+fps = 30
 """@fps Frames per second in the output video.
         Note: if this doesnt match the original, timing will appear different.
         ex: slow down by 4x, but original is 30fps, and output is 60fps, will result in an overall 2x slow down 
         (not 4x as queried)."""
 
-downsampleFactor = 1 # ex: 2x downsample for 1920x1080 input -> 960x540 output
+downsampleFactor = 2 # ex: 2x downsample for 1920x1080 input -> 960x540 output
 maxFramesToWrite = 500 # how many input frames to process from the input video
 skipFrames = 0 # how many frames to skip in the beginning
 
@@ -35,12 +35,12 @@ class Configuration(Enum):
     BACKGROUND_EXTRACT = "backgroundExtract"
 
 # controls which effect will be applied
-configuration = Configuration.SLOW_MOTION
+configuration = Configuration.MOTION_BACKGROUND_EXTRACT
 
 ########################################################################################################################
 
 # optical flow window size (in pixels? not certain, see opencv implementation)
-flowWindowSize = 25
+flowWindowSize = 30
 
 ########################################################################################################################
 # SLOW_MOTION configurable parameters
@@ -55,18 +55,17 @@ ms_slowDownFactor = 10
 # the background to be (severely) distorted/transformed, as the algorithm compensates for motion.
 # one disadvantage of relying on edge motion too much is sparsity of flow in inner regions of motions, ore regions
 # that are not considered as edges, hence this constant should be set according to the input image (trial and error)
-ms_edgeFlowInfluence = 0.2
+ms_edgeFlowInfluence = 0.05
 
 ########################################################################################################################
 # MOTION_DUPLICATION configurable parameters
 
 # how many frames frames to consider for history of motion duplication
-md_bufferSize = 2
+md_bufferSize = 2 # TODO: remove this param
 
 # how much to decay intensity of the duplication over time, 0 for full intensity; [0-1], 1 turns the effect off
 md_strength = 1
 
-# normalized value for which the
 md_threshold = 0.1
 
 ########################################################################################################################
@@ -114,17 +113,17 @@ while(cap.isOpened()):
             # operator must be initialized here to support skipping frames
             if operator == None:
                 if configuration == Configuration.SLOW_MOTION:
-                    operator = MotionSlower(prvs, ms_slowDownFactor, ms_edgeFlowInfluence, flowWindowSize)
+                    operator = MCFI(prvs, ms_slowDownFactor, ms_edgeFlowInfluence, flowWindowSize)
                 elif configuration == Configuration.MOTION_BACKGROUND_EXTRACT:
-                    operator = MotionExtractor(prvs, md_bufferSize, md_strength, md_threshold, flowWindowSize)
+                    operator = MCBE(prvs, md_bufferSize, md_strength, md_threshold, flowWindowSize)
                 elif configuration == Configuration.BACKGROUND_EXTRACT:
-                    operator = BackgroundExtractor(prvs)
+                    operator = BE(prvs)
                 else:
                     print("Unsupported configuration.")
                     exit(1)
 
             # process frame
-            flow, frames = operator.processFrame(next)
+            extra, flow, frames = operator.processFrame(next)
 
             # write resulting frames
             for index, frame in enumerate(frames):
@@ -134,6 +133,10 @@ while(cap.isOpened()):
             # write flow as images
             for index, _flow in enumerate(flow):
                 writeFlowMap(pathFramesOut, _flow, count, str(index))
+
+            # write flow as images
+            for index, motionMap in enumerate(extra):
+                cv2.imwrite("{}/motionMap-{}-{}.jpg".format(pathFramesOut, count, index), motionMap)  # image
 
         prvs = next
 

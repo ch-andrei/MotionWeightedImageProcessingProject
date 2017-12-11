@@ -7,7 +7,7 @@ from laplacianBlend import diffWeightedLaplacianBlend
 
 ########################################################################################################################
 
-class BackgroundExtractor:
+class BE:
     def __init__(self, frame):
         self.count = 1
         self.image = frame.astype(np.float32)
@@ -16,23 +16,34 @@ class BackgroundExtractor:
         image = (self.image * self.count + frame) / (self.count + 1)
         self.image = np.clip(image, 0, 255)
         self.count += 1
-        return [], [self.image.astype(np.uint8)]
+        return [], [], [self.image.astype(np.uint8)]
 
-class MotionExtractor:
-    def __init__(self, frame, windowSize, strength, threshold, flowWinSize, momentum=0.5):
+# motion compensated background extractor
+class MCBE:
+    def __init__(self, frame, windowSize, strength, threshold, flowWinSize,
+                 flowMotionTreshold=0.05,
+                 flowPow=0.5,
+                 countPow=0.9
+                 ):
         self.bufferSize = windowSize
         self.frameBuffer = []
         self.flowBuffer = []
         self.diffBuffer = []
+        # initially this was intended to have a fixed window size, but then i just implemented a global average
+        # that uses motion weighted averaging
 
         self.strength = strength
         self.threshold = threshold
         self.flowWinSize = flowWinSize
-        self.momentum = momentum
+        self.flowWinSizeDiag = np.sqrt(2 * self.flowWinSize**2)
+        self.flowMotionTreshold = flowMotionTreshold
+        self.flowPow = flowPow
+        self.countPow = countPow
 
         self.processedCount = 0
         self.addFrame(frame)
 
+        self.motionMap = np.zeros(frame.shape[:2], np.float32)
         self.bg = frame.copy()
         self.count = 1
         self.diff = np.zeros(frame.shape[:2], np.float32)
@@ -42,30 +53,47 @@ class MotionExtractor:
 
         bg = self.bg
 
+        motionMap = None
+
         # analyze background
         if len(self.flowBuffer) > 0:
             _frame = self.frameBuffer[-1]
             _flow = self.flowBuffer[-1]
 
-            crtFlow = np.linalg.norm(np.abs(_flow), axis=2) # magnitude of flow
-            crtFlow /= np.sqrt(2 * self.flowWinSize**2)
-            crtFlow = crtFlow ** 0.1
-            crtFlow = scipy.ndimage.gaussian_filter(crtFlow, 1, mode="constant", cval=0)
-            crtFlow = remapRange(crtFlow, crtFlow.min(), crtFlow.max()) # stretch to fill [0-1] fully
-            crtFlow = remapRange(crtFlow, self.threshold, 1. - self.threshold) # condense within smaller range
+            # returns binary decision: is pixel moving or not
+            def getMotionMask(_flow):
+                flow = np.linalg.norm(np.abs(_flow), axis=2) # magnitude of flow
+                flow /= self.flowWinSizeDiag
+
+                # flow = flow**self.flowPow
+
+                flow = scipy.ndimage.gaussian_filter(flow, 3, mode="constant", cval=0) # smoothen
+
+                flow = remapRange(flow, 0, max(0.5, flow.max()))
+                flow = remapRange(flow, self.flowMotionTreshold, 1. - self.flowMotionTreshold)
+
+                # binarize decision
+                flow[flow >= self.flowMotionTreshold] = 1
+                flow[flow < self.flowMotionTreshold] = 0
+
+                flow = scipy.ndimage.gaussian_filter(flow, 3, mode="constant", cval=0) # smoothen the boundary
+
+                return flow
+
+            motionMap = getMotionMask(_flow)
 
             for i in range(3):
-                nonMovingPart = _frame[..., i] * (1. - self.strength * crtFlow)
-                bgPart = bg[..., i] * (self.count + self.strength * crtFlow)
-
-                bg[..., i] = (bgPart + nonMovingPart) / (self.count + 1)
+                countFactor = self.count**self.countPow
+                nonMovingPart = _frame[..., i] * (self.strength * (1. - motionMap))
+                bgPart = bg[..., i] * (countFactor + self.strength * motionMap)
+                bg[..., i] = (bgPart + nonMovingPart) / (countFactor + self.strength)
 
             self.count += 1
 
         bg = np.clip(bg, 0, 255)
         self.bg = bg
 
-        return [self.flowBuffer[len(self.flowBuffer) - 1]], [bg.astype(np.uint8)]
+        return [(motionMap * 255).astype(np.uint8)], [self.flowBuffer[len(self.flowBuffer) - 1]], [bg.astype(np.uint8)]
 
     def getCurrent(self):
         return self.frameBuffer[-1]
@@ -73,6 +101,7 @@ class MotionExtractor:
     def getPrevious(self):
         return self.frameBuffer[-2]
 
+    # window of size N frame buffer
     def addFrame(self, frame):
         print(len(self.frameBuffer))
         self.processedCount += 1
@@ -100,13 +129,6 @@ class MotionExtractor:
             print("[Warning] MotionDuplicator.getPrevious(): Not enough frames in buffer.")
 
     def opticalFlow(self, prvs, next):
-        # helps with motion tracking
-        def discretize(img, bandsPerChannel=10):  # remap from full color range to a total of bands**3 possible colors
-            return np.round(np.round(img / bandsPerChannel) * bandsPerChannel).astype(np.uint8)
-
-        def enhanceImgForMotionEstimation(img, offset=50):
-            return discretize(img)
-
         frame1 = enhanceImgForMotionEstimation(cv2.cvtColor(prvs, cv2.COLOR_BGR2GRAY))
         frame2 = enhanceImgForMotionEstimation(cv2.cvtColor(next, cv2.COLOR_BGR2GRAY))
         flow = cv2.calcOpticalFlowFarneback(frame1, frame2, None, 0.5, 7, self.flowWinSize, 6, 5, 1.2, 0)
@@ -115,7 +137,60 @@ class MotionExtractor:
 
 ########################################################################################################################
 
-class MotionSlower:
+# nearest frame interpolation
+class NFI:
+    def __init__(self, frame,
+                 slowDownFactor,
+                 edgeFlowInfluence,
+                 flowWinSize):
+        self.prvs = frame
+        self.slowDownFactor = slowDownFactor
+        self.count = 0
+
+    def processFrame(self, next):
+        self.count += 1
+
+        frames = []
+        for i in range(self.slowDownFactor):
+            frames.append(self.prvs)
+
+        self.prvs = next
+
+        return [], [], frames
+
+# linear blend frame interpolation
+class LBFI:
+    def __init__(self, frame,
+                 slowDownFactor,
+                 edgeFlowInfluence,
+                 flowWinSize):
+        self.prvs = frame
+        self.slowDownFactor = slowDownFactor
+        self.count = 0
+
+    def processFrame(self, next):
+        self.count += 1
+
+        frames = []
+        lerpIncr = 1.0 / (self.slowDownFactor)
+        for i in range(self.slowDownFactor):
+            ratio = (i + 1) * lerpIncr
+
+            frame = self.lerpFrame(self.prvs, next, ratio).astype(np.uint8)
+
+            frames.append(frame)
+
+        self.prvs = next
+
+        return [], [], frames
+
+    # simple ratio linear blend
+    def lerpFrame(self, frame1, frame2, ratio=0):
+        ratio = max(0., min(1., ratio)) # clip to [0-1]
+        return (1.0 - ratio) * frame1 + ratio * frame2
+
+# motion compensated frame interpolation
+class MCFI:
     def __init__(self, frame,
                  slowDownFactor,
                  edgeFlowInfluence,
@@ -130,16 +205,6 @@ class MotionSlower:
         self.count += 1
         frame1 = cv2.cvtColor(self.prvs, cv2.COLOR_BGR2GRAY)
         frame2 = cv2.cvtColor(next, cv2.COLOR_BGR2GRAY)
-
-        # helps with motiin tracking
-        def discretize(img, bands=20):
-            # remap from full color range to a total of bands**3 possible colors, or bands for grayscale input
-            scaler = bands / 255
-            return np.round(np.round(img * scaler) / scaler).astype(np.uint8)
-
-        def enhanceImgForMotionEstimation(img):
-            img = remapRange(img, 35, 245, 255)
-            return discretize(img)
 
         frameEnh1 = enhanceImgForMotionEstimation(frame1)
         frameEnh2 = enhanceImgForMotionEstimation(frame2)
@@ -158,8 +223,8 @@ class MotionSlower:
         flowBackwardEdges = cv2.calcOpticalFlowFarneback(edges2, edges1, None, 0.5, 7, self.flowWinSize, 6, 5, 1.2, 0)
 
         # include edge flow influence
-        flowForward =  (flowForwardRaw  * (1.0 - self.edgeFlowInfluence) + flowForwardEdges  * self.edgeFlowInfluence)
-        flowBackward = (flowBackwardRaw * (1.0 - self.edgeFlowInfluence) + flowBackwardEdges * self.edgeFlowInfluence)
+        flowForward =  (flowForwardRaw  + flowForwardEdges  * self.edgeFlowInfluence) / (1.0 + self.edgeFlowInfluence)
+        flowBackward = (flowBackwardRaw + flowBackwardEdges * self.edgeFlowInfluence) / (1.0 + self.edgeFlowInfluence)
 
         flow = [flowForward, flowBackward, flowForwardRaw, flowBackwardRaw, flowForwardEdges, flowBackwardEdges]
 
@@ -194,12 +259,7 @@ class MotionSlower:
 
         self.prvs = next
 
-        return flow, frames
-
-    # simple ratio linear blend
-    def lerpFrame(self, frame1, frame2, ratio=0):
-        ratio = max(0., min(1., ratio)) # clip to [0-1]
-        return (1.0 - ratio) * frame1 + ratio * frame2
+        return [], flow, frames
 
     def motionWeightedLerpFrame(self, next, gridPixelFlow1, gridPixelFlow2, ratio=0):
         ratio = max(0., min(1., ratio)) # clip to [0-1]
